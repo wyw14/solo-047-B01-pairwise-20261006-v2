@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -18,20 +19,49 @@ func (s *Server) ingestTelemetry(writer http.ResponseWriter, request *http.Reque
 		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
+	// A client-supplied Idempotency-Key identifies a logical submission across
+	// retries. When absent, the generated sample ID serves as the key for this
+	// attempt only.
+	key := request.Header.Get("Idempotency-Key")
 	sample := telemetry.Sample{
 		ID: s.services.IDs.New("sample"), AssetID: repeaterID, Kind: telemetry.Kind(input.Kind),
 		Value: input.Value, Unit: input.Unit, Sequence: input.Sequence, Generation: input.Generation,
 		ObservedAt: s.services.Clock.Now().UTC(),
 	}
-	if err := s.services.Telemetry.Apply(request.Context(), sample); err != nil {
-		writeError(writer, http.StatusConflict, err)
+	if key == "" {
+		key = sample.ID
+	}
+	if err := sample.Validate(); err != nil {
+		writeError(writer, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.services.Persist("telemetry", sample.ID, sample); err != nil {
-		writeError(writer, http.StatusInternalServerError, err)
+	result, err := s.services.IngestTelemetry(request.Context(), key, sample)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrIdempotencyConflict), errors.Is(err, telemetry.ErrSamplePending):
+			writeError(writer, http.StatusConflict, err)
+		case result.Sample.ID == "":
+			// The durable write never happened: there is no retry handle.
+			writeError(writer, http.StatusInternalServerError, err)
+		default:
+			// The sample is durably persisted but not yet projected. Surface
+			// the sample ID so the client can retry with it as the
+			// Idempotency-Key instead of producing a duplicate inbound.
+			writeJSON(writer, http.StatusServiceUnavailable, map[string]any{
+				"error":           err.Error(),
+				"sample_id":       result.Sample.ID,
+				"idempotency_key": key,
+			})
+		}
 		return
 	}
-	writeJSON(writer, http.StatusAccepted, sample)
+	// 200 for an idempotent replay, 202 for a sample that just crossed the
+	// projection/commit boundary for the first time.
+	status := http.StatusAccepted
+	if !result.Stored || result.Replayed {
+		status = http.StatusOK
+	}
+	writeJSON(writer, status, result.Sample)
 }
 
 func (s *Server) getRepeater(writer http.ResponseWriter, request *http.Request) {
