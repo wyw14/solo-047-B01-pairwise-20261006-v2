@@ -48,3 +48,21 @@ func (r *Repeater) update(mutator func(*Snapshot)) Snapshot {
 	mutator(&r.snapshot)
 	return r.snapshot
 }
+
+// CommitProjected applies mutator only while the projection-owned fields still
+// match expected (Health, TemperatureC, LastSequence, TripGeneration). Fields
+// owned by other controllers (StableStep) are ignored by the comparison and
+// preserved. It returns false when a competing projection changed the state,
+// letting the caller fail the ingestion instead of overwriting it.
+func (r *Repeater) CommitProjected(expected Snapshot, mutator func(*Snapshot)) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.snapshot.Health != expected.Health ||
+		r.snapshot.TemperatureC != expected.TemperatureC ||
+		r.snapshot.LastSequence != expected.LastSequence ||
+		r.snapshot.TripGeneration != expected.TripGeneration {
+		return false
+	}
+	mutator(&r.snapshot)
+	return true
+}

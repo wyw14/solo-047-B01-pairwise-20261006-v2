@@ -2,6 +2,7 @@ package repeater
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/wyw14/cry-103/internal/telemetry"
@@ -31,6 +32,11 @@ func (p *HealthProjector) Register(repeater *Repeater) {
 	p.repeaters[repeater.Snapshot().ID] = repeater
 }
 
+// ApplySample is atomic: it computes the next snapshot, performs the incident
+// side effect first, and only commits the repeater's projection fields once
+// every side effect succeeded. On error the observable state is unchanged, so
+// the ingestor can mark the ingestion failed and retry the same key without
+// double-applying.
 func (p *HealthProjector) ApplySample(_ context.Context, sample telemetry.Sample) error {
 	if sample.Kind != telemetry.KindTemperature {
 		return nil
@@ -45,19 +51,40 @@ func (p *HealthProjector) ApplySample(_ context.Context, sample telemetry.Sample
 	if sample.Sequence <= before.LastSequence || sample.Generation < before.TripGeneration {
 		return nil
 	}
-	after := repeater.update(func(current *Snapshot) {
-		current.LastSequence = sample.Sequence
-		current.TemperatureC = sample.Value
-		current.UpdatedAt = sample.ObservedAt.UTC()
-		if sample.Value >= p.tripAtC {
-			current.Health = HealthTripped
-			current.TripGeneration = sample.Generation
-		} else if current.Health != HealthTripped {
-			current.Health = HealthNormal
+
+	after := before
+	after.LastSequence = sample.Sequence
+	after.TemperatureC = sample.Value
+	after.UpdatedAt = sample.ObservedAt.UTC()
+	trips := false
+	if sample.Value >= p.tripAtC {
+		after.Health = HealthTripped
+		after.TripGeneration = sample.Generation
+		trips = true
+	} else if before.Health != HealthTripped {
+		after.Health = HealthNormal
+	}
+
+	// External side effect happens before the local state commit. If it fails
+	// the repeater snapshot stays at `before` and the ingestion is retried.
+	if trips && before.Health != HealthTripped && p.incidents != nil {
+		if err := p.incidents.OpenRepeaterIncident(after.ID, after.TripGeneration); err != nil {
+			return fmt.Errorf("open repeater incident: %w", err)
 		}
+	}
+
+	committed := repeater.CommitProjected(before, func(current *Snapshot) {
+		current.LastSequence = after.LastSequence
+		current.TemperatureC = after.TemperatureC
+		current.UpdatedAt = after.UpdatedAt
+		current.Health = after.Health
+		current.TripGeneration = after.TripGeneration
 	})
-	if before.Health != HealthTripped && after.Health == HealthTripped && p.incidents != nil {
-		return p.incidents.OpenRepeaterIncident(after.ID, after.TripGeneration)
+	if !committed {
+		// A concurrent projection advanced the repeater between the read and
+		// the commit. Surface it as a failure so this sample is retried and
+		// ordered by sequence instead of silently overwriting a newer sample.
+		return fmt.Errorf("repeater %s projection changed concurrently for sample %d", sample.AssetID, sample.Sequence)
 	}
 	return nil
 }

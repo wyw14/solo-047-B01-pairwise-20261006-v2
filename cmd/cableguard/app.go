@@ -61,7 +61,8 @@ func buildServices(cfg config) (*api.Services, error) {
 		return nil, err
 	}
 	healthProjector.Register(repeaterR07)
-	ingestor := telemetry.NewIngestor(telemetryRepository, now, healthProjector)
+	ingestor := telemetry.NewIngestor(telemetryRepository, now, healthProjector).
+		WithLedger(api.NewTelemetryLedger(journal, now))
 
 	scanner := landing.NewScanner(topologies, 2*time.Millisecond)
 	otdrService := otdr.NewSessionService(topologies, scanner, ids, now)

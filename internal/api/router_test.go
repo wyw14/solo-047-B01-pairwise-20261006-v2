@@ -57,16 +57,19 @@ func testServer(t *testing.T) *Server {
 	projector := repeater.NewHealthProjector(lifecycle, 85)
 	projector.Register(repeaterAsset)
 	repository := telemetry.NewRepository()
+	ingestJournal := store.NewJournal(filepath.Join(t.TempDir(), "telemetry-events.jsonl"))
+	ingestor := telemetry.NewIngestor(repository, clock.Now, projector).
+		WithLedger(NewTelemetryLedger(ingestJournal, clock.Now))
 	acceptance := repair.NewAcceptanceService(switchover.NewRestorer(drainer, activator, registry, ids, clock.Now), clock.Now)
 	acceptance.Register("S3", target, path)
 	services := &Services{
-		Clock: clock, IDs: ids, Journal: store.NewJournal(filepath.Join(t.TempDir(), "events.jsonl")),
+		Clock: clock, IDs: ids, Journal: ingestJournal,
 		Spans: map[string]*span.Span{"S3": target}, Routes: map[string]*route.Route{"R-S3": path},
 		Repeaters: map[string]*repeater.Repeater{"R07": repeaterAsset}, Topology: registry,
 		OTDR:        otdr.NewSessionService(registry, landing.NewScanner(registry, 0), ids, clock.Now),
 		Switchovers: switchover.NewSessionService(drainer, activator, ids, clock.Now, time.Second),
 		Permits:     permitService, Receipts: receipts, Acceptance: acceptance,
-		Telemetry: telemetry.NewIngestor(repository, clock.Now, projector), TelemetryRepository: repository,
+		Telemetry: ingestor, TelemetryRepository: repository,
 		Admission: incident.NewAdmissionService(telemetry.NewMuteManager(clock.Now)),
 	}
 	return NewServer(services)
